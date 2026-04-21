@@ -6,6 +6,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 from src.core.context import ContextEngine
 from src.core.llm import LLMClient, LLMResponse
@@ -46,7 +47,7 @@ class AgentLoop:
         self.registry = registry
         self.memory = memory or ConversationMemory()
         self.policy_checker = policy_checker or AllowAllPolicy()
-        self.policy_context = PolicyContext()
+        #ßself.policy_context = PolicyContext()
 
         self.config = config or LoopConfig()
 
@@ -64,23 +65,38 @@ class AgentLoop:
         return base
 
     def _execute_tool(self, name: str, arguments: dict[str, Any]) -> str:
-        """Look up a tool, check policy, execute, and return result as string."""
+        """Look up a tool, check policy, execute with timeout, return result."""
         tool = self.registry.get(name)
         if tool is None:
             msg = f"Tool '{name}' not found in registry."
             logger.warning(msg)
             return json.dumps({"error": msg})
 
-        # Policy gate
-        if not self.policy_checker(name, arguments):
-            msg = f"Policy denied execution of tool '{name}'."
-            logger.warning(msg)
-            return json.dumps({"error": msg, "denied": True})
+        # Build context from tool metadata
+        context = PolicyContext(skill=tool.skill)
 
+        # Policy gate
+        decision = self.policy_checker.evaluate(name, arguments, context)
+        if not decision.allow:
+            msg = f"Policy denied execution of tool '{name}': {decision.reason}"
+            logger.warning(msg)
+            return json.dumps({"error": msg, "denied": True, "reason": decision.reason})
+
+        # Execute with timeout
         try:
-            logger.info(f"Executing tool: {name} with args: {arguments}")
-            result = tool.handler(**arguments)
+            logger.info(
+                f"Executing tool: {name} (timeout={decision.timeout_seconds}s)"
+            )
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(tool.handler, **arguments)
+                result = future.result(timeout=decision.timeout_seconds)
             return json.dumps(result) if not isinstance(result, str) else result
+
+        except FuturesTimeout:
+            msg = f"Tool '{name}' timed out after {decision.timeout_seconds}s."
+            logger.error(msg)
+            return json.dumps({"error": msg, "timeout": True})
+
         except Exception as e:
             msg = f"Tool '{name}' raised an error: {e}"
             logger.error(msg)
